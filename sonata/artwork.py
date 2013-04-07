@@ -1,5 +1,6 @@
 import functools
 import logging
+import queue
 import os
 import re
 import shutil
@@ -84,8 +85,7 @@ class Artwork(GObject.GObject):
     }
 
     def __init__(self, config, is_lang_rtl, schedule_gc_collect,
-                 imagelist_append, remotefilelist_append,
-                 allow_art_search, status_is_play_or_pause,
+                 status_is_play_or_pause,
                  album_image, tray_image):
         super().__init__()
 
@@ -97,9 +97,6 @@ class Artwork(GObject.GObject):
 
         # callbacks to main XXX refactor to clear this list
         self.schedule_gc_collect = schedule_gc_collect
-        self.imagelist_append = imagelist_append
-        self.remotefilelist_append = remotefilelist_append
-        self.allow_art_search = allow_art_search
         self.status_is_play_or_pause = status_is_play_or_pause
 
         # local pixbufs, image file names
@@ -121,8 +118,6 @@ class Artwork(GObject.GObject):
         self.lastalbumart = None
         self.single_img_in_dir = None
         self.misc_img_in_dir = None
-        self.stop_art_update = False
-        self.downloading_image = False
         self.lib_art_cond = None
 
         # local artwork, cache for library
@@ -162,12 +157,6 @@ class Artwork(GObject.GObject):
         pix = pix.new_subpixbuf(0, 0, 77, 77)
         self.tray_album_image.set_from_pixbuf(pix)
         del pix
-
-    def artwork_stop_update(self):
-        self.stop_art_update = True
-
-    def artwork_is_downloading_image(self):
-        return self.downloading_image
 
     def library_artwork_init(self, model, pb_size):
 
@@ -265,8 +254,8 @@ class Artwork(GObject.GObject):
                                                         self.lib_art_pb_size)
             filename = artwork_path_from_data(data.artist, data.album,
                                               data.path, self.config)
-            self.artwork_download_img_to_file(data.artist, data.album,
-                                              filename)
+            RemoteArtworkDownloader(self.config, data.artist, data.album,
+                                    filename)
 
         # Set pixbuf icon in model; add to cache
         if pb is not None and filename is not None:
@@ -315,7 +304,6 @@ class Artwork(GObject.GObject):
         if force:
             self.lastalbumart = None
 
-        self.stop_art_update = False
         if not self.config.show_covers:
             return
         if not self.songinfo:
@@ -350,7 +338,6 @@ class Artwork(GObject.GObject):
             filename = artwork_path_from_song(self.songinfo, self.config)
             if filename == self.lastalbumart:
                 # No need to update..
-                self.stop_art_update = False
                 return
             self.lastalbumart = None
             imgfound = self.artwork_check_for_local(artist, album, path)
@@ -424,7 +411,7 @@ class Artwork(GObject.GObject):
 
     def artwork_check_for_remote(self, artist, album, path, filename):
         self.artwork_set_default_icon(artist, album, path)
-        self.artwork_download_img_to_file(artist, album, filename)
+        RemoteArtworkDownloader(self.config, artist, album, filename)
         if os.path.exists(filename):
             GLib.idle_add(self.artwork_set_image, filename, artist, album, path)
             return True
@@ -527,22 +514,51 @@ class Artwork(GObject.GObject):
         # If we got this far, no match:
         return False
 
-    def artwork_download_img_to_file(self, artist, album, dest_filename,
-                                     all_images=False):
+    def have_last(self):
+        if self.lastalbumart is not None:
+            return True
+        return False
 
-        downloader = CoverDownloader(dest_filename, self.download_progress,
-                                     all_images)
 
-        self.downloading_image = True
+class RemoteArtworkDownloaderWorker(threading.Thread):
+    def __init__(self, config, artist, album,
+                 destination, all_images=False):
+
+        self.output_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        args = (config, artist, album, destination,
+                self.output_queue.put if all_images else None,
+                self._stop_event.is_set)
+
+        super().__init__(name="RemoteArtworkDownloaderThread", args=args,
+                         target=RemoteArtworkDownloader)
+        self.daemon = True
+
+    def stop(self):
+        self._stop_event.set()
+
+
+class RemoteArtworkDownloader:
+    def __init__(self, config, artist, album, dest_filename,
+                 add_cb=None, should_stop_cb=lambda: False):
+        self.config = config
+        self.artist = artist
+        self.album = album
+        self.path = dest_filename
+        self.max_images = 50 if add_cb else 1
+        self.current = 0
+        self.add_cb = add_cb if add_cb else lambda x: None
+        self.should_stop_cb = should_stop_cb
+
         # Fetch covers from covers websites or such...
         cover_fetchers = pluginsystem.get('cover_fetching')
-        for plugin, callback in cover_fetchers:
+        for plugin, plugin_callback in cover_fetchers:
             logger.info("Looking for covers for %r from %r (using %s)",
-                        album, artist, plugin.name)
+                        self.album, self.artist, plugin.name)
 
             try:
-                callback(artist, album,
-                         downloader.on_save_callback, downloader.on_err_cb)
+                plugin_callback(self.artist, self.album,
+                                self.on_save_callback, self.on_err_callback)
             except Exception as e:
                 if logger.isEnabledFor(logging.DEBUG):
                     log = logger.exception
@@ -552,50 +568,11 @@ class Artwork(GObject.GObject):
                 log("Error while downloading covers from %s: %s",
                     plugin.name, e)
 
-            if downloader.found_images:
+            if self.current > 0 or self.should_stop_cb():
+                # The plugin founds images, no need to call the other plugins
                 break
 
-        self.downloading_image = False
-        return downloader.found_images
-
-    def download_progress(self, dest_filename_curr, i):
-        # This populates Main.imagelist for the remote image window
-        if os.path.exists(dest_filename_curr):
-            pix = GdkPixbuf.Pixbuf.new_from_file(dest_filename_curr)
-            pix = pix.scale_simple(148, 148, GdkPixbuf.InterpType.HYPER)
-            pix = img.do_style_cover(self.config, pix, 148, 148)
-            pix = img.pixbuf_add_border(pix)
-            if self.stop_art_update:
-                del pix
-                return False # don't continue to next image
-            self.imagelist_append([i + 1, pix])
-            del pix
-            self.remotefilelist_append(dest_filename_curr)
-            if i == 0:
-                self.allow_art_search()
-
-            ui.change_cursor(None)
-
-        return True # continue to next image
-
-    def have_last(self):
-        if self.lastalbumart is not None:
-            return True
-        return False
-
-
-class CoverDownloader:
-    """Download covers and store them in temporary files"""
-
-    def __init__(self, path, progress_cb, all_images):
-        self.path = path
-        self.progress_cb = progress_cb
-        self.max_images = 50 if all_images else 1
-        self.current = 0
-
-    @property
-    def found_images(self):
-        return self.current != 0
+        logger.debug("Finished!")
 
     def on_save_callback(self, content_fp):
         """Return True to continue finding covers, False to stop finding
@@ -610,15 +587,18 @@ class CoverDownloader:
         with open(path, 'wb') as fp:
             shutil.copyfileobj(content_fp, fp)
 
-        if self.max_images > 1:
-            # XXX: progress_cb makes sense only if we are downloading several
-            # images, since it is supposed to update the choose artwork
-            # dialog...
-            return self.progress_cb(path, self.current-1)
+        pix = GdkPixbuf.Pixbuf.new_from_file(path)
+        pix = pix.scale_simple(148, 148, GdkPixbuf.InterpType.HYPER)
+        pix = img.do_style_cover(self.config, pix, 148, 148)
+        pix = img.pixbuf_add_border(pix)
+        logger.debug("Found artwork %s", path)
+        self.add_cb((path, pix))
+        del pix # XXX why?
+        return not self.should_stop_cb()
 
-    def on_err_cb(self, reason=None):
+    def on_err_callback(self, reason=None):
         """Return True to stop finding, False to continue finding covers."""
-        return False
+        return self.should_stop_cb()
 
 
 class ArtworkCache:
