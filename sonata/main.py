@@ -214,9 +214,9 @@ class Base:
         self.artwork = artwork.Artwork(
             self.config, misc.is_lang_rtl(self.window),
             self.schedule_gc_collect,
+            # XXX
             self.status_is_play_or_pause,
             self.album_image, self.tray_album_image)
-
 
         # Popup menus:
         actions = [
@@ -3044,14 +3044,6 @@ class RemoteArtworkDialog:
         refresh_button = self.builder.get_object('artwork_update_button')
         refresh_button.connect('clicked', self.on_refresh_clicked)
 
-    def show(self):
-        self.path_destination = artwork.artwork_path(self.songinfo,
-                                                         self.config)
-        self.image_widget.connect('item-activated', self.on_icon_view_activated)
-        self.choose_dialog.connect('response', self.on_dialog_response,
-                                   self.image_widget)
-        self.remote_artistentry.set_text(self.songinfo.artist or '')
-        self.remote_albumentry.set_text(self.songinfo.album or '')
         self.chooseimage_visible = True
         self.on_refresh_clicked(None)
         self.choose_dialog.show_all()

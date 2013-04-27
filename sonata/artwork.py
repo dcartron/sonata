@@ -2,9 +2,10 @@ import functools
 import logging
 import queue
 import os
+import queue
 import re
 import shutil
-import threading # artwork_update starts a thread _artwork_update
+import threading
 
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, GObject
 
@@ -76,6 +77,65 @@ def artwork_path(song, config):
     return f
 
 
+# XXX check name
+def artwork_get_misc_img_in_path(musicdir, songdir):
+    path = os.path.join(musicdir, songdir)
+    if os.path.exists(path):
+        for name in consts.ART_LOCATIONS_MISC:
+            filename = os.path.join(path, name)
+            if os.path.exists(filename):
+                return filename
+    return False
+
+
+def find_local_image(config, artist, album, song_dir):
+    """Returns a tuple (location_type, filename) or (None, None).
+
+    Only pass a artist, album and song directory if we don't want to use info
+    from the currently playing song.
+    """
+
+    assert song_dir is not None, (artist, album, song_dir)
+
+    get_artwork_path_from_song = functools.partial(artwork_path_from_data,
+        artist, album, song_dir, config)
+
+    # Give precedence to images defined by the user's current
+    # art_location config (in case they have multiple valid images
+    # that can be used for cover art).
+    testfile = get_artwork_path_from_song()
+    if os.path.exists(testfile):
+        return config.art_location, testfile
+
+    # Now try all local possibilities...
+    simplelocations = [consts.ART_LOCATION_HOMECOVERS,
+               consts.ART_LOCATION_COVER,
+               consts.ART_LOCATION_ALBUM,
+               consts.ART_LOCATION_FOLDER]
+    for location in simplelocations:
+        testfile = get_artwork_path_from_song(location)
+        if os.path.exists(testfile):
+            return location, testfile
+
+    testfile = get_artwork_path_from_song(consts.ART_LOCATION_CUSTOM)
+    if config.art_location == consts.ART_LOCATION_CUSTOM and \
+       len(config.art_location_custom_filename) > 0 and \
+       os.path.exists(testfile):
+        return consts.ART_LOCATION_CUSTOM, testfile
+
+    musicdir = config.current_musicdir
+    if artwork_get_misc_img_in_path(musicdir, song_dir):
+        return consts.ART_LOCATION_MISC, \
+                artwork_get_misc_img_in_path(musicdir, song_dir)
+
+    path = os.path.join(config.current_musicdir, song_dir)
+    testfile = img.single_image_in_dir(path)
+    if testfile is not None:
+        return consts.ART_LOCATION_SINGLE, testfile
+
+    return None, None
+
+
 class Artwork(GObject.GObject):
 
     __gsignals__ = {
@@ -118,7 +178,6 @@ class Artwork(GObject.GObject):
         self.lastalbumart = None
         self.single_img_in_dir = None
         self.misc_img_in_dir = None
-        self.lib_art_cond = None
 
         # local artwork, cache for library
         self.lib_model = None
@@ -128,6 +187,10 @@ class Artwork(GObject.GObject):
 
         self.cache = ArtworkCache(self.config)
         self.cache.load()
+
+        self.jobs_queue = queue.Queue()
+        self.results_queue = queue.Queue()
+        self.x = 0
 
     def update_songinfo(self, songinfo):
         self.songinfo = songinfo
@@ -163,108 +226,52 @@ class Artwork(GObject.GObject):
         self.lib_model = model
         self.lib_art_pb_size = pb_size
 
-        self.lib_art_cond = threading.Condition()
-        thread = threading.Thread(target=self._library_artwork_update)
-        thread.name = "ArtworkLibraryUpdate"
-        thread.daemon = True
-        thread.start()
+        # Launch thread
+        ArtworkUpdateWorker(self.jobs_queue, self.results_queue, pb_size,
+                            self.config).start()
 
     def library_artwork_update(self, model, start_row, end_row, albumpb):
         self.albumpb = albumpb
 
         # Update self.lib_art_rows_local with new rows followed
         # by the rest of the rows.
-        self.lib_art_cond.acquire()
-        self.lib_art_rows_local = []
-        self.lib_art_rows_remote = []
         start = start_row.get_indices()[0]
         end = end_row.get_indices()[0]
         test_rows = list(range(start, end + 1)) + list(range(len(model)))
-        for row in test_rows:
-            i = model.get_iter((row,))
-            icon = model.get_value(i, 0)
-            if icon == self.albumpb:
-                data = model.get_value(i, 1)
-                self.lib_art_rows_local.append((i, data, icon))
-        self.lib_art_cond.notifyAll()
-        self.lib_art_cond.release()
 
-    def _library_artwork_update(self):
-        while True:
-            # Wait for items..
-            self.lib_art_cond.acquire()
-            while(len(self.lib_art_rows_local) == 0 and \
-                  len(self.lib_art_rows_remote) == 0):
-                self.lib_art_cond.wait()
-            self.lib_art_cond.release()
+        def loop(x):
+            logger.error("%d starting with %d rows", x, len(test_rows))
+            for i, row in enumerate(test_rows):
+                iter = model.get_iter((row,))
+                icon = model.get_value(iter, 0)
+                if icon == self.albumpb:
+                    data = model.get_value(iter, 1)
+                    #logger.info("%d: pushing %s", x, data)
+                    self.jobs_queue.put((iter, data, icon))
 
-            # Try first element, giving precedence to local queue:
-            if self.lib_art_rows_local:
-                i, data, icon = self.lib_art_rows_local.pop(0)
-                cb = self._library_artwork_update_local
-            elif self.lib_art_rows_remote:
-                i, data, icon = self.lib_art_rows_remote.pop(0)
-                cb = self._library_artwork_update_remote
-            else:
-                continue
+                if i % 50:
+                    yield True
+            logger.error("%d finishing", x)
+            yield False
+        self.x += 1
+        l = loop(self.x)
+        GLib.idle_add(next, l)
 
-            cache_key = SongRecord(artist=data.artist, album=data.album,
-                                         path=data.path)
-            # Try to replace default icons with cover art:
-            pb = self.cache.get_pixbuf(cache_key, self.lib_art_pb_size)
-            cb(i, data, icon, cache_key, pb)
+        GLib.timeout_add(500, self.check_results_queue)
 
+    def check_results_queue(self):
+        for i in range(20):
+            try:
+                (iter, pixbuf, data) = self.results_queue.get(False)
+            except queue.Empty:
+                break
 
-    def _library_artwork_update_local(self, i, data, icon, cache_key, pb):
-        filename = None
+            if self.lib_model.iter_is_valid(iter):
+                if self.lib_model.get_value(iter, 1) == data:
+                    logger.info("Setting library pixbuf for %s", data)
+                    self.lib_model.set_value(iter, 0, pixbuf)
 
-        if pb is not None:
-            # Continue to rescan for local artwork if we are
-            # displaying the default album image, in case the user
-            # has added a local image since we first scanned.
-            filename = self.cache.get(cache_key)
-            if os.path.basename(filename) == os.path.basename(
-                self.album_filename):
-                filename = None
-                pb = None
-
-        # No cached pixbuf, try local/remote search:
-        if pb is None:
-            pb, filename = self.library_get_album_cover(
-                data.path, data.artist, data.album, self.lib_art_pb_size)
-
-        # Set pixbuf icon in model; add to cache
-        if pb is not None and filename is not None:
-            self.cache.set(cache_key, filename)
-            GLib.idle_add(self.library_set_cover, i, pb, data)
-
-        if pb is None and self.config.covers_pref == consts.ART_LOCAL_REMOTE:
-            # No local art found, add to remote queue for later
-            self.lib_art_rows_remote.append((i, data, icon))
-
-
-    def _library_artwork_update_remote(self, i, data, icon, cache_key, pb):
-        filename = None
-
-        # No cached pixbuf, try local/remote search:
-        if pb is None:
-            pb, filename = self.library_get_album_cover(data.path,
-                                                        data.artist,
-                                                        data.album,
-                                                        self.lib_art_pb_size)
-            filename = artwork_path_from_data(data.artist, data.album,
-                                              data.path, self.config)
-            RemoteArtworkDownloader(self.config, data.artist, data.album,
-                                    filename)
-
-        # Set pixbuf icon in model; add to cache
-        if pb is not None and filename is not None:
-            self.cache.set(cache_key, filename)
-            GLib.idle_add(self.library_set_cover, i, pb, data)
-
-        if pb is None:
-            # No remote art found, store self.albumpb filename in cache
-            self.cache.set(cache_key, self.album_filename)
+        GLib.timeout_add(500, self.check_results_queue)
 
 
     def library_set_image_for_current_song(self, cache_key):
@@ -279,27 +286,6 @@ class Artwork(GObject.GObject):
                 if pb:
                     self.lib_model.set_value(row.iter, 0, pb)
 
-    def library_set_cover(self, i, pb, data):
-        if self.lib_model.iter_is_valid(i):
-            if self.lib_model.get_value(i, 1) == data:
-                self.lib_model.set_value(i, 0, pb)
-
-    def library_get_album_cover(self, song_dir, artist, album, pb_size):
-        _tmp, coverfile = self.artwork_get_local_image(artist, album, song_dir)
-        if coverfile:
-            try:
-                coverpb = GdkPixbuf.Pixbuf.new_from_file_at_size(coverfile,
-                                                            pb_size, pb_size)
-            except:
-                # Delete bad image:
-                misc.remove_file(coverfile)
-                return (None, None)
-            w = coverpb.get_width()
-            h = coverpb.get_height()
-            coverpb = img.do_style_cover(self.config, coverpb, w, h)
-            return (coverpb, coverfile)
-        return (None, None)
-
     def artwork_update(self, force=False):
         if force:
             self.lastalbumart = None
@@ -311,8 +297,8 @@ class Artwork(GObject.GObject):
             return
 
         if self.status_is_play_or_pause():
-            thread = threading.Thread(target=self._artwork_update)
-            thread.name = "ArtworkUpdate"
+            thread = threading.Thread(target=self._artwork_update,
+                                      name="ArtworkUpdate")
             thread.daemon = True
             thread.start()
         else:
@@ -341,17 +327,18 @@ class Artwork(GObject.GObject):
                 return
             self.lastalbumart = None
             imgfound = self.artwork_check_for_local(artist, album, path)
-            if not imgfound:
-                if self.config.covers_pref == consts.ART_LOCAL_REMOTE:
-                    imgfound = self.artwork_check_for_remote(artist, album,
-                                                             path, filename)
+            # XXX
+            #if not imgfound:
+                #if self.config.covers_pref == consts.ART_LOCAL_REMOTE:
+                    #imgfound = self.artwork_check_for_remote(artist, album,
+                                                             #path, filename)
 
     def artwork_check_for_local(self, artist, album, path):
         self.artwork_set_default_icon(artist, album, path)
         self.misc_img_in_dir = None
         self.single_img_in_dir = None
-        location_type, filename = self.artwork_get_local_image(
-            self.songinfo.artist, self.songinfo.album,
+        location_type, filename = find_local_image(
+            self.config, self.songinfo.artist, self.songinfo.album,
             os.path.dirname(self.songinfo.file))
 
         if location_type is not None and filename:
@@ -363,51 +350,6 @@ class Artwork(GObject.GObject):
             return True
 
         return False
-
-    def artwork_get_local_image(self, artist, album, song_dir=None):
-        # Returns a tuple (location_type, filename) or (None, None).
-        # Only pass a artist, album and song directory if we don't want
-        # to use info from the currently playing song.
-
-        if song_dir is None:
-            song_dir = os.path.dirname(self.songinfo.file)
-
-        get_artwork_path_from_song = functools.partial(artwork_path_from_data,
-            artist, album, song_dir, self.config)
-
-        # Give precedence to images defined by the user's current
-        # art_location config (in case they have multiple valid images
-        # that can be used for cover art).
-        testfile = get_artwork_path_from_song()
-        if os.path.exists(testfile):
-            return self.config.art_location, testfile
-
-        # Now try all local possibilities...
-        simplelocations = [consts.ART_LOCATION_HOMECOVERS,
-                   consts.ART_LOCATION_COVER,
-                   consts.ART_LOCATION_ALBUM,
-                   consts.ART_LOCATION_FOLDER]
-        for location in simplelocations:
-            testfile = get_artwork_path_from_song(location)
-            if os.path.exists(testfile):
-                return location, testfile
-
-        testfile = get_artwork_path_from_song(consts.ART_LOCATION_CUSTOM)
-        if self.config.art_location == consts.ART_LOCATION_CUSTOM and \
-           len(self.config.art_location_custom_filename) > 0 and \
-           os.path.exists(testfile):
-            return consts.ART_LOCATION_CUSTOM, testfile
-
-        if self.artwork_get_misc_img_in_path(song_dir):
-            return consts.ART_LOCATION_MISC, \
-                    self.artwork_get_misc_img_in_path(song_dir)
-
-        path = os.path.join(self.config.current_musicdir, song_dir)
-        testfile = img.single_image_in_dir(path)
-        if testfile is not None:
-            return consts.ART_LOCATION_SINGLE, testfile
-
-        return None, None
 
     def artwork_check_for_remote(self, artist, album, path, filename):
         self.artwork_set_default_icon(artist, album, path)
@@ -431,15 +373,6 @@ class Artwork(GObject.GObject):
             cache_key = SongRecord(artist=artist, album=album, path=path)
             self.cache.set(cache_key, self.album_filename)
             GLib.idle_add(self.library_set_image_for_current_song, cache_key)
-
-    def artwork_get_misc_img_in_path(self, songdir):
-        path = os.path.join(self.config.current_musicdir, songdir)
-        if os.path.exists(path):
-            for name in consts.ART_LOCATIONS_MISC:
-                filename = os.path.join(path, name)
-                if os.path.exists(filename):
-                    return filename
-        return False
 
     def artwork_set_image(self, filename, artist, album, path,
                           info_img_only=False):
@@ -653,3 +586,80 @@ class ArtworkCache:
                 self._cache = eval(f.read())
         except (IOError, SyntaxError) as e:
             self.logger.info("Unable to load: %s", e)
+
+
+class ArtworkUpdateWorker(threading.Thread):
+    def __init__(self, job_queue, output_queue, size, config):
+        self.queue = job_queue
+        self.output_queue = output_queue # XXX
+        self.size = size # XXX
+        self.config = config
+        super().__init__(name="LibArtworkUpdateWorker")
+        self.daemon = True
+        self.in_process = set()
+        self._remote_queue = queue.Queue()
+
+    def run(self):
+        while True:
+            i, data, icon = self.queue.get()
+            if data in self.in_process or data.path is None:
+                # "path is None" happens for 'Untagged' songs, maybe streams?
+                continue
+            else:
+                self.in_process.add(data)
+
+            if self.find_local(i, data):
+                self._remote_queue.put(i, data, icon)
+
+        #self.in_process.clear()
+
+        #while True:
+            #e, data, icon = self._remote_queue.get()
+            #if data in self.in_process:
+                #continue
+            #else:
+                #self.in_process.add(data)
+            #self.find_remote(i, data):
+
+    def find_local(self, i, data):
+        cover_file = find_local_image(self.config, data.artist, data.album,
+                                      data.path)[1]
+        if not cover_file:
+            logger.debug("No local artwork for %s", data)
+            return False
+
+        pb = self.build_pixbuf(cover_file)
+        if pb is None:
+            return False
+
+        logger.debug("Found local artwork '%s' for %s", cover_file, data)
+        self.output_queue.put((i, pb, data)) # XXX need to put data ?
+        return True
+
+    def find_remote(self, i, data):
+        cover_file = artwork_path_from_data(data.artist, data.album, data.path,
+                                            self.config)
+        RemoteArtworkDownloader(config, data.artist, data.album, cover_file)
+
+        pb = self.build_pixbuf(cover_file)
+        if pb is None:
+            logger.debug("No remote artwork for %s", data)
+            return False
+
+        logger.debug("Found remote artwork '%s' for %s", cover_file, data)
+        self.output_queue.put((i, pb, data)) # XXX need to put data ?
+        return True
+
+    def build_pixbuf(self, cover_file):
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(cover_file,
+                                                        self.size, self.size)
+        except Exception as e:
+            # Delete bad image
+            logger.warning("Unable to load image from '%s': %s", cover_file, e)
+            misc.remove_file(cover_file)
+            return
+
+        w = pb.get_width()
+        h = pb.get_height()
+        return img.do_style_cover(self.config, pb, w, h)
